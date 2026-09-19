@@ -2,6 +2,7 @@
 
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -391,6 +392,83 @@ class TestFilesystemRenameViaToolDispatch:
             assert isinstance(result, Command)
             assert not (Path(root) / "old.txt").exists()
             assert (Path(root) / "new.txt").read_text() == "hello"
+
+
+@pytest.fixture
+def ascii_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate a platform whose default text encoding is not UTF-8.
+
+    `Path.read_text` / `Path.write_text` fall back to the locale encoding when no
+    `encoding` is given. Forcing that fallback to ASCII mirrors what happens on a
+    Windows machine with a cp1252 / cp936 code page, without depending on the
+    locale of the machine running the tests.
+    """
+    original_read_text = Path.read_text
+    original_write_text = Path.write_text
+
+    def read_text(self: Path, encoding: str | None = None, **kwargs: Any) -> str:
+        return original_read_text(self, encoding=encoding or "ascii", **kwargs)
+
+    def write_text(
+        self: Path, data: str, encoding: str | None = None, **kwargs: Any
+    ) -> int:
+        return original_write_text(self, data, encoding=encoding or "ascii", **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "write_text", write_text)
+
+
+class TestFilesystemFileEncoding:
+    """Filesystem middleware must read and write files as UTF-8 on any platform."""
+
+    NON_ASCII = "# Café ☕\nnaïve 🙂"
+
+    @pytest.mark.usefixtures("ascii_locale")
+    def test_create_writes_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            middleware = FilesystemClaudeTextEditorMiddleware(root_path=root)
+
+            middleware._handle_create(
+                {"path": "/notes.md", "file_text": self.NON_ASCII}, "tc-1"
+            )
+
+            on_disk = (Path(root) / "notes.md").read_bytes()
+            assert on_disk == (self.NON_ASCII + "\n").encode("utf-8")
+
+    @pytest.mark.usefixtures("ascii_locale")
+    def test_view_str_replace_insert_read_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / "notes.md"
+            target.write_bytes((self.NON_ASCII + "\n").encode("utf-8"))
+            middleware = FilesystemClaudeTextEditorMiddleware(root_path=root)
+
+            viewed = middleware._handle_view({"path": "/notes.md"}, "tc-1")
+            assert isinstance(viewed, Command)
+            assert viewed.update is not None
+            assert "Café ☕" in viewed.update["messages"][0].content
+
+            middleware._handle_str_replace(
+                {"path": "/notes.md", "old_str": "naïve", "new_str": "naïf"}, "tc-2"
+            )
+            middleware._handle_insert(
+                {"path": "/notes.md", "insert_line": 1, "new_str": "Ünïcode"}, "tc-3"
+            )
+
+            assert target.read_bytes() == "# Café ☕\nÜnïcode\nnaïf 🙂\n".encode()
+
+    def test_str_replace_and_insert_reject_undecodable_file(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "bad.bin").write_bytes(b"\xff\xfe\x00 not utf-8")
+            middleware = FilesystemClaudeTextEditorMiddleware(root_path=root)
+
+            with pytest.raises(ValueError, match="Cannot decode file"):
+                middleware._handle_str_replace(
+                    {"path": "/bad.bin", "old_str": "a", "new_str": "b"}, "tc-1"
+                )
+            with pytest.raises(ValueError, match="Cannot decode file"):
+                middleware._handle_insert(
+                    {"path": "/bad.bin", "insert_line": 0, "new_str": "x"}, "tc-2"
+                )
 
 
 class TestSystemMessageHandling:
